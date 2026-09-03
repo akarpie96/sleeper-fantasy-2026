@@ -215,23 +215,31 @@ def cheatsheet_from_csv(csv_path: str) -> list:
     return entries
 
 
-PREP_SYSTEM = """You are building a fantasy football draft cheat sheet for the upcoming \
-season. Your training data predates this season, so you MUST use web search to establish \
-the current landscape: this year's consensus rankings and ADP, confirmed starting roles, \
-offseason moves, rookie situations, and any significant injuries or suspensions.
+RESEARCH_SYSTEM = """You are scouting the current NFL season for a fantasy football draft.
+Your training data predates this season, so use web search to establish the current
+landscape.
 
-Produce a ranked, tiered board of the top 200 players overall.
+Cover: this season's consensus top-150 draft order and ADP, backfield and target-share
+roles that changed in the offseason, rookies with real projected roles, notable holdouts
+or suspensions, and current injuries.
 
-Output ONLY a JSON array — no prose before or after, no markdown fences. Each element:
-  {"name": "Full Name", "pos": "RB", "team": "SF", "rank": 1, "tier": 1, "note": "<=10 words"}
+Write a dense scouting brief in plain prose — no JSON. Prioritize facts that would change
+where a player is drafted. Be specific with names. Aim for roughly 1500 words."""
+
+
+BOARD_SYSTEM = """You are converting a scouting brief into a fantasy football draft board.
+
+Output ONLY a JSON array — no prose before or after, no markdown fences, no commentary.
+Each element must be exactly:
+  {"name": "Full Name", "pos": "RB", "team": "SF", "rank": 12, "tier": 3, "note": "<=8 words"}
 
 Rules:
-- "rank" is overall draft rank, 1..200, strictly increasing, no gaps.
-- "tier" groups players of similar value; a tier break means a real drop-off.
 - "pos" is exactly one of QB, RB, WR, TE, K, DEF.
-- "note" is a terse edge: role, risk, or upside. Keep it under ten words.
-- Include kickers and defenses only in the last ~20 slots.
-Accuracy of names matters — they are matched against Sleeper's database."""
+- "tier" groups players of similar value; a tier break means a real drop-off.
+- "note" is a terse edge: role, risk, or upside. Under eight words.
+- Player names must be exact and conventional — they are matched against a database.
+- Emit every rank in the requested range and nothing outside it.
+Start your response with [ and end it with ]."""
 
 
 def run_prep(args) -> int:
@@ -262,45 +270,137 @@ def run_prep(args) -> int:
         except requests.exceptions.RequestException:
             pass
 
-    print("Researching current rankings and building your cheat sheet.")
-    print("This takes a few minutes and only needs to happen once.\n")
-
     client = anthropic.Anthropic()
+    research_path = args.cheatsheet + ".research.txt"
+
+    # --- Phase 1: research only. No structured output competing for the budget. ---
+    brief = ""
+    if args.reuse_research and os.path.exists(research_path):
+        with open(research_path) as f:
+            brief = f.read()
+        print(f"Reusing existing research brief ({len(brief)} chars) from {research_path}\n")
+    else:
+        print("Phase 1/2: researching the current season (a few minutes)...\n")
+        brief = stream_call(
+            client,
+            system=RESEARCH_SYSTEM,
+            user="Write the scouting brief." + context,
+            max_tokens=12000,
+            tools=[{"type": "web_search_20260209", "name": "web_search", "max_uses": 10}],
+            show_text=False,
+        )
+        if not brief.strip():
+            print("The research phase returned no text. Falling back to Sleeper's ordering:",
+                  file=sys.stderr)
+            print(f"  python {os.path.basename(__file__)} --prep --from-sleeper", file=sys.stderr)
+            return 1
+        with open(research_path, "w") as f:
+            f.write(brief)
+        print(f"\nResearch brief saved ({len(brief)} chars).\n")
+
+    # --- Phase 2: convert to a board, in batches so no single call carries it all. ---
+    print(f"Phase 2/2: building the board in batches of {args.batch}...\n")
+    collected = []
+    for start in range(1, args.size + 1, args.batch):
+        end = min(start + args.batch - 1, args.size)
+        print(f"  ranks {start}-{end} ... ", end="", flush=True)
+        text = stream_call(
+            client,
+            system=BOARD_SYSTEM,
+            user=(f"Scouting brief:\n\n{brief}\n\n"
+                  f"Now emit overall ranks {start} through {end} as a JSON array."
+                  + context),
+            max_tokens=8000,
+            tools=None,
+            show_text=False,
+        )
+        batch = parse_json_array(text) or []
+        collected.extend(batch)
+        print(f"{len(batch)} players")
+        if not batch:
+            with open(f"{args.cheatsheet}.batch{start}.raw.txt", "w") as f:
+                f.write(text)
+
+    if not collected:
+        print("\nNo players recovered. Fall back to Sleeper's ordering:", file=sys.stderr)
+        print(f"  python {os.path.basename(__file__)} --prep --from-sleeper", file=sys.stderr)
+        return 1
+
+    entries = normalize_entries(collected)
+    print()
+    save_cheatsheet(entries, "claude+websearch", args.cheatsheet)
+    verify_cheatsheet(args)
+    return 0
+
+
+def stream_call(client, system, user, max_tokens, tools=None, show_text=False) -> str:
+    """One streaming call. Reports why it stopped when it produces nothing."""
+    request = {
+        "model": MODEL,
+        "max_tokens": max_tokens,
+        "system": system,
+        "messages": [{"role": "user", "content": user}],
+    }
+    if tools:
+        request["tools"] = tools
+
     chunks = []
-    with client.messages.stream(
-        model=MODEL,
-        max_tokens=32000,
-        system=PREP_SYSTEM,
-        tools=[{"type": "web_search_20260209", "name": "web_search", "max_uses": 20}],
-        messages=[{"role": "user", "content": "Build the top-200 board." + context}],
-    ) as stream:
+    final = None
+    with client.messages.stream(**request) as stream:
         for event in stream:
             etype = getattr(event, "type", None)
             if etype == "text":
                 chunks.append(event.text)
+                if show_text:
+                    print(event.text, end="", flush=True)
             elif etype == "content_block_start":
                 bt = getattr(getattr(event, "content_block", None), "type", None)
                 if bt == "server_tool_use":
                     print("[researching...]", flush=True)
+        try:
+            final = stream.get_final_message()
+        except Exception:
+            pass
 
-    raw = "".join(chunks).strip()
-    # Always keep the raw response so a parse failure is recoverable without re-researching.
-    raw_path = args.cheatsheet + ".raw.txt"
-    try:
-        with open(raw_path, "w") as f:
-            f.write(raw)
-    except OSError:
-        pass
+    text = "".join(chunks)
+    if not text.strip() and final is not None:
+        reason = getattr(final, "stop_reason", "unknown")
+        print(f"\n  (no text produced; stop_reason={reason})", file=sys.stderr)
+        if reason == "max_tokens":
+            print("  The token budget was consumed before any output was written.",
+                  file=sys.stderr)
+    return text
 
-    entries = parse_json_array(raw)
-    if not entries:
-        print(f"Could not parse the model output. Raw text saved to {raw_path}", file=sys.stderr)
-        print(f"Try: python {os.path.basename(__file__)} --repair", file=sys.stderr)
-        return 1
 
-    entries = normalize_entries(entries)
-    save_cheatsheet(entries, "claude+websearch", args.cheatsheet)
-    verify_cheatsheet(args)
+def run_prep_from_sleeper(args) -> int:
+    """Build a cheat sheet from Sleeper's own player ordering. No API, no network
+    beyond the player database you already cache. Always works."""
+    players = get_all_players(force_refresh=args.refresh_players)
+
+    pool = []
+    for pid, p in players.items():
+        pos = p.get("position")
+        if pos not in FANTASY_POSITIONS or not p.get("team") or not p.get("active", True):
+            continue
+        sr = p.get("search_rank")
+        if sr is None:
+            continue
+        name = p.get("full_name") or f"{p.get('first_name','')} {p.get('last_name','')}".strip()
+        if not name:
+            continue
+        pool.append({"name": name, "pos": pos, "team": p.get("team"),
+                     "rank": sr, "tier": None, "note": ""})
+
+    pool.sort(key=lambda e: e["rank"])
+    entries = normalize_entries(pool[:args.size])
+
+    # Tier by gaps in Sleeper's ordering: a jump means a drop-off.
+    for i, e in enumerate(entries):
+        e["tier"] = i // 12 + 1
+
+    save_cheatsheet(entries, "sleeper search_rank", args.cheatsheet)
+    print("\nNote: this is Sleeper's own ordering, not researched rankings. "
+          "It is a solid backbone but carries no injury/role context.")
     return 0
 
 
@@ -779,9 +879,16 @@ def main() -> int:
     parser.add_argument("--prep", action="store_true",
                         help="Build the cheat sheet (run once, before the draft)")
     parser.add_argument("--from-csv", help="Build the cheat sheet from a rankings CSV instead")
+    parser.add_argument("--from-sleeper", action="store_true",
+                        help="Build the cheat sheet from Sleeper's own ordering (no API, instant)")
     parser.add_argument("--repair", action="store_true",
                         help="Rebuild the cheat sheet from a saved raw response (no API call)")
     parser.add_argument("--raw", help="Raw response file to repair from")
+    parser.add_argument("--size", type=int, default=200, help="How many players to rank (default 200)")
+    parser.add_argument("--batch", type=int, default=50,
+                        help="Players per generation call (default 50)")
+    parser.add_argument("--reuse-research", action="store_true",
+                        help="Skip re-researching; reuse the saved brief")
     parser.add_argument("--league-id", help="Sleeper league ID")
     parser.add_argument("--draft-id", help="Sleeper draft ID directly (mock drafts)")
     parser.add_argument("--my-username", help="Your Sleeper username (required for live mode)")
@@ -796,6 +903,8 @@ def main() -> int:
     try:
         if args.repair:
             return run_repair(args)
+        if args.from_sleeper:
+            return run_prep_from_sleeper(args)
         if args.prep or args.from_csv:
             return run_prep(args)
 

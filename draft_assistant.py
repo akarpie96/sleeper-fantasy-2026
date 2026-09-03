@@ -276,8 +276,24 @@ def run_prep(args) -> int:
                 f"Scoring (non-zero): {json.dumps(active)}\n"
                 f"Teams: {league.get('total_rosters')}"
             )
-        except requests.exceptions.RequestException:
-            pass
+            print(f"Tailoring to '{league.get('name')}' "
+                  f"({league.get('total_rosters')} teams, "
+                  f"{len([s for s in league.get('roster_positions') or [] if s not in BENCH_SLOTS])} "
+                  f"starting slots).\n")
+        except (requests.exceptions.RequestException, ValueError) as e:
+            # Don't silently build an untailored board — the user asked for this league.
+            print(f"Could not load league '{args.league_id}': {e}", file=sys.stderr)
+            print("Check the ID (Sleeper league IDs are ~19 digits — a clipped leading "
+                  "character is the usual cause of a 404).", file=sys.stderr)
+            print("List yours with: python test_sleeper_access.py --username YOU --season 2026",
+                  file=sys.stderr)
+            if not args.ignore_league_error:
+                print("\nStopping so you don't spend a research run on an untailored board.",
+                      file=sys.stderr)
+                print("Re-run with --ignore-league-error to build a generic board anyway.",
+                      file=sys.stderr)
+                return 1
+            print("Continuing with a generic, untailored board.\n", file=sys.stderr)
 
     client = anthropic.Anthropic()
     research_path = args.cheatsheet + ".research.txt"
@@ -923,6 +939,8 @@ def main() -> int:
                         help="Players per generation call (default 50)")
     parser.add_argument("--reuse-research", action="store_true",
                         help="Skip re-researching; reuse the saved brief")
+    parser.add_argument("--ignore-league-error", action="store_true",
+                        help="Build a generic board even if the league can't be loaded")
     parser.add_argument("--league-id", help="Sleeper league ID")
     parser.add_argument("--draft-id", help="Sleeper draft ID directly (mock drafts)")
     parser.add_argument("--my-username", help="Your Sleeper username (required for live mode)")

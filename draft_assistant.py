@@ -51,6 +51,14 @@ CHEATSHEET_PATH = "draft_cheatsheet.json"
 BENCH_SLOTS = ("BN", "IR", "TAXI")
 NAME_SUFFIXES = {"jr", "sr", "ii", "iii", "iv", "v"}
 
+# Nicknames rankings sites use that differ from the legal name Sleeper stores.
+# Punctuation and initials are already handled by normalize_name ("A.J. Brown"
+# and "AJ Brown" both reduce to "aj brown"), so only real name differences
+# belong here. Keys and values must both be in normalized form.
+NAME_ALIASES = {
+    "hollywood brown": "marquise brown",
+}
+
 
 # --- Sleeper API ------------------------------------------------------------
 
@@ -121,7 +129,8 @@ def normalize_name(name: str) -> str:
         return ""
     cleaned = re.sub(r"[^a-z ]", "", name.lower())
     parts = [p for p in cleaned.split() if p and p not in NAME_SUFFIXES]
-    return " ".join(parts)
+    key = " ".join(parts)
+    return NAME_ALIASES.get(key, key)
 
 
 def player_key(name: str, position: str) -> str:
@@ -304,19 +313,44 @@ def run_prep(args) -> int:
     for start in range(1, args.size + 1, args.batch):
         end = min(start + args.batch - 1, args.size)
         print(f"  ranks {start}-{end} ... ", end="", flush=True)
+
+        # Each batch is an independent call with no memory of the others, so it
+        # will happily re-emit obvious names. Tell it what is already placed.
+        taken = [e.get("name", "") for e in collected if e.get("name")]
+        exclusion = ""
+        if taken:
+            exclusion = (
+                "\n\nThese players are ALREADY on the board at earlier ranks. "
+                "Do not include any of them again; continue past them:\n"
+                + ", ".join(taken)
+            )
+
         text = stream_call(
             client,
             system=BOARD_SYSTEM,
             user=(f"Scouting brief:\n\n{brief}\n\n"
                   f"Now emit overall ranks {start} through {end} as a JSON array."
-                  + context),
+                  + exclusion + context),
             max_tokens=8000,
             tools=None,
             show_text=False,
         )
         batch = parse_json_array(text) or []
-        collected.extend(batch)
-        print(f"{len(batch)} players")
+
+        # Drop any repeats that slipped through, so the count printed is truthful.
+        seen = {(normalize_name(e.get("name", "")), (e.get("pos") or "").upper())
+                for e in collected}
+        fresh = []
+        for e in batch:
+            key = (normalize_name(e.get("name", "")), (e.get("pos") or "").upper())
+            if key in seen or not e.get("name"):
+                continue
+            seen.add(key)
+            fresh.append(e)
+
+        collected.extend(fresh)
+        dupes = len(batch) - len(fresh)
+        print(f"{len(fresh)} new" + (f" ({dupes} repeats dropped)" if dupes else ""))
         if not batch:
             with open(f"{args.cheatsheet}.batch{start}.raw.txt", "w") as f:
                 f.write(text)

@@ -695,6 +695,21 @@ def compute_needs(roster_positions: list, my_positions: list) -> dict:
 
 FLEX_ELIGIBLE = {"RB", "WR", "TE"}
 
+# A flat penalty punishes "Questionable" (common, often just a game-time-decision
+# note, especially this far before Week 1) as harshly as "Out" — enough to bury
+# a top-5 talent below a run of ordinary healthy players many ranks worse.
+# Scale by actual severity instead.
+INJURY_PENALTY = {
+    "Questionable": 3,
+    "Doubtful": 15,
+    "Out": 25,
+    "IR": 40,
+    "PUP": 40,
+    "NA": 40,
+    "Suspended": 40,
+}
+DEFAULT_INJURY_PENALTY = 5
+
 
 def compute_depth_targets(roster_positions: list, override: str = None) -> dict:
     """How many of each position to end the draft holding, starters plus bench.
@@ -792,7 +807,7 @@ def build_board(players: dict, drafted_ids: set, sheet_index: dict, limit: int =
 
 def recommend(board: list, starter_needs: dict, targets: dict, have: Counter,
               my_picks: list, next_pick_no: int, runs: Counter,
-              picks_left: int, top_n: int = 6) -> dict:
+              picks_left: int, top_n: int = 8) -> dict:
     """Local scoring: board value, starter needs, bench depth targets, scarcity,
     and survival to the wrap. Every adjustment records a reason so the
     recommendation can explain itself."""
@@ -852,8 +867,9 @@ def recommend(board: list, starter_needs: dict, targets: dict, have: Counter,
             reasons.append("gone by your wrap")
 
         if p["injury"]:
-            score -= 10
-            reasons.append(str(p["injury"]))
+            penalty = INJURY_PENALTY.get(p["injury"], DEFAULT_INJURY_PENALTY)
+            score -= penalty
+            reasons.append(f"{p['injury']} (-{penalty})")
         if not p["ranked"]:
             score -= 200
             reasons.append("not on your board")
@@ -889,7 +905,7 @@ def render_recommendation(reco: dict, my_picks: list, draft: dict,
         print(f"        why: {' · '.join(best['reasons'])}")
 
     print("\n  IF HE'S GONE:")
-    for s in reco["picks"][1:5]:
+    for s in reco["picks"][1:7]:
         q = s["player"]
         tier = f" T{q['tier']}" if q["tier"] else ""
         inj = f" [{q['injury']}]" if q["injury"] else ""

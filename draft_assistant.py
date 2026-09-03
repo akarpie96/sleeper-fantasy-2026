@@ -854,13 +854,21 @@ def run_live(args) -> int:
         )
         my_roster_id = my_roster["roster_id"] if my_roster else None
 
-    my_slot = my_slot_from_draft(draft, my_user["user_id"], my_roster_id)
     teams = (draft.get("settings") or {}).get("teams") or 0
-    if my_slot:
-        print(f"Drafting from slot {my_slot} of {teams}.")
+    if args.slot:
+        if teams and not (1 <= args.slot <= teams):
+            print(f"--slot {args.slot} is outside 1..{teams} for this draft.", file=sys.stderr)
+            return 1
+        my_slot = args.slot
+        print(f"Drafting from slot {my_slot} of {teams} (set manually).")
     else:
-        print("Draft order not assigned yet — Sleeper usually sets it just before the draft. "
-              "Recommendations still work; the wrap math activates once your slot is known.")
+        my_slot = my_slot_from_draft(draft, my_user["user_id"], my_roster_id)
+        if my_slot:
+            print(f"Drafting from slot {my_slot} of {teams}.")
+        else:
+            print("Draft order not published by Sleeper yet — it often stays hidden until "
+                  "the draft starts.")
+            print("If you already know your pick position, pass it: --slot N")
     time.sleep(1.5)
 
     clear_cmd = "cls" if os.name == "nt" else "clear"
@@ -869,7 +877,7 @@ def run_live(args) -> int:
         draft = get_draft(draft_id)
         picks = sorted(get_draft_picks(draft_id), key=lambda p: p.get("pick_no") or 0)
         next_pick_no = len(picks) + 1
-        if my_slot is None:
+        if my_slot is None and not args.slot:
             my_slot = my_slot_from_draft(draft, my_user["user_id"], my_roster_id)
 
         my_picks = my_upcoming_picks(draft, next_pick_no, my_slot) if my_slot else []
@@ -944,6 +952,9 @@ def main() -> int:
     parser.add_argument("--league-id", help="Sleeper league ID")
     parser.add_argument("--draft-id", help="Sleeper draft ID directly (mock drafts)")
     parser.add_argument("--my-username", help="Your Sleeper username (required for live mode)")
+    parser.add_argument("--slot", type=int,
+                        help="Your draft position (1 = first pick). Use when Sleeper "
+                             "has not published the draft order yet.")
     parser.add_argument("--cheatsheet", default=CHEATSHEET_PATH,
                         help=f"Cheat sheet path (default {CHEATSHEET_PATH})")
     parser.add_argument("--poll", type=int, default=5, help="Seconds between polls (default 5)")

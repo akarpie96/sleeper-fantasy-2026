@@ -284,34 +284,152 @@ def run_prep(args) -> int:
                     print("[researching...]", flush=True)
 
     raw = "".join(chunks).strip()
-    entries = parse_json_array(raw)
-    if entries is None:
-        fallback = args.cheatsheet + ".raw.txt"
-        with open(fallback, "w") as f:
+    # Always keep the raw response so a parse failure is recoverable without re-researching.
+    raw_path = args.cheatsheet + ".raw.txt"
+    try:
+        with open(raw_path, "w") as f:
             f.write(raw)
-        print(f"Could not parse the model output as JSON. Raw text saved to {fallback}",
-              file=sys.stderr)
+    except OSError:
+        pass
+
+    entries = parse_json_array(raw)
+    if not entries:
+        print(f"Could not parse the model output. Raw text saved to {raw_path}", file=sys.stderr)
+        print(f"Try: python {os.path.basename(__file__)} --repair", file=sys.stderr)
         return 1
 
+    entries = normalize_entries(entries)
     save_cheatsheet(entries, "claude+websearch", args.cheatsheet)
     verify_cheatsheet(args)
     return 0
 
 
+def run_repair(args) -> int:
+    """Rebuild a cheat sheet from a saved raw response — no API call, no re-research."""
+    raw_path = args.raw or (args.cheatsheet + ".raw.txt")
+    if not os.path.exists(raw_path):
+        print(f"No raw file at {raw_path}", file=sys.stderr)
+        return 1
+
+    with open(raw_path) as f:
+        raw = f.read()
+
+    entries = parse_json_array(raw)
+    if not entries:
+        print(f"Found no usable records in {raw_path}.", file=sys.stderr)
+        print("Fall back to a rankings CSV: --prep --from-csv rankings.csv", file=sys.stderr)
+        return 1
+
+    entries = normalize_entries(entries)
+    print(f"Recovered {len(entries)} players from {raw_path}")
+    save_cheatsheet(entries, "claude+websearch (repaired)", args.cheatsheet)
+    verify_cheatsheet(args)
+    return 0
+
+
 def parse_json_array(raw: str):
-    """Tolerate stray prose or code fences around the JSON array."""
+    """Tolerate stray prose, code fences, or a truncated/malformed array."""
     candidate = raw.strip()
     if candidate.startswith("```"):
         candidate = re.sub(r"^```(?:json)?\s*", "", candidate)
         candidate = re.sub(r"\s*```$", "", candidate)
+
     start, end = candidate.find("["), candidate.rfind("]")
-    if start == -1 or end == -1:
-        return None
-    try:
-        data = json.loads(candidate[start:end + 1])
-    except json.JSONDecodeError:
-        return None
-    return data if isinstance(data, list) else None
+    if start != -1 and end != -1:
+        try:
+            data = json.loads(candidate[start:end + 1])
+            if isinstance(data, list) and data:
+                return data
+        except json.JSONDecodeError:
+            pass  # fall through to object-by-object salvage
+
+    salvaged = salvage_objects(candidate)
+    return salvaged or None
+
+
+def salvage_objects(raw: str) -> list:
+    """Pull every complete {...} record out of the text.
+
+    Survives a response that was truncated mid-array, wrapped in prose, or had
+    one bad record in the middle — we keep every object that parses on its own.
+    """
+    entries = []
+    depth = 0
+    start = None
+    in_string = False
+    escaped = False
+
+    for i, ch in enumerate(raw):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start is not None:
+                    chunk = raw[start:i + 1]
+                    try:
+                        obj = json.loads(chunk)
+                    except json.JSONDecodeError:
+                        obj = None
+                    if isinstance(obj, dict) and obj.get("name"):
+                        entries.append(obj)
+                    start = None
+    return entries
+
+
+def normalize_entries(entries: list) -> list:
+    """Coerce salvaged records into the cheat sheet shape and re-rank cleanly."""
+    cleaned = []
+    for e in entries:
+        name = str(e.get("name", "")).strip()
+        if not name:
+            continue
+        pos = re.sub(r"\d+$", "", str(e.get("pos") or e.get("position") or "").strip().upper())
+        try:
+            rank = int(float(e.get("rank")))
+        except (TypeError, ValueError):
+            rank = None
+        try:
+            tier = int(float(e.get("tier")))
+        except (TypeError, ValueError):
+            tier = None
+        cleaned.append({
+            "name": name,
+            "pos": pos,
+            "rank": rank,
+            "tier": tier,
+            "note": str(e.get("note") or "")[:80],
+            "team": str(e.get("team") or ""),
+        })
+
+    # Keep the model's ordering where ranks are missing or duplicated.
+    ranked = [e for e in cleaned if e["rank"] is not None]
+    unranked = [e for e in cleaned if e["rank"] is None]
+    ranked.sort(key=lambda e: e["rank"])
+    ordered = ranked + unranked
+
+    seen = set()
+    final = []
+    for e in ordered:
+        key = (normalize_name(e["name"]), e["pos"])
+        if key in seen:
+            continue
+        seen.add(key)
+        e["rank"] = len(final) + 1  # contiguous, so rank compares to pick numbers
+        final.append(e)
+    return final
 
 
 def verify_cheatsheet(args) -> None:
@@ -661,6 +779,9 @@ def main() -> int:
     parser.add_argument("--prep", action="store_true",
                         help="Build the cheat sheet (run once, before the draft)")
     parser.add_argument("--from-csv", help="Build the cheat sheet from a rankings CSV instead")
+    parser.add_argument("--repair", action="store_true",
+                        help="Rebuild the cheat sheet from a saved raw response (no API call)")
+    parser.add_argument("--raw", help="Raw response file to repair from")
     parser.add_argument("--league-id", help="Sleeper league ID")
     parser.add_argument("--draft-id", help="Sleeper draft ID directly (mock drafts)")
     parser.add_argument("--my-username", help="Your Sleeper username (required for live mode)")
@@ -673,6 +794,8 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
+        if args.repair:
+            return run_repair(args)
         if args.prep or args.from_csv:
             return run_prep(args)
 

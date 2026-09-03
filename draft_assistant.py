@@ -696,6 +696,57 @@ def compute_needs(roster_positions: list, my_positions: list) -> dict:
 FLEX_ELIGIBLE = {"RB", "WR", "TE"}
 
 
+def compute_depth_targets(roster_positions: list, override: str = None) -> dict:
+    """How many of each position to end the draft holding, starters plus bench.
+
+    One QB and one TE (a backup at either is a dead roster spot in a 1QB league),
+    exactly one K and one DEF, and every remaining slot split between RB and WR
+    with RB taking the odd one — RB attrition is worse and handcuffs pay off.
+    """
+    starters = Counter()
+    flex_slots = 0
+    bench = 0
+    superflex = False
+    for slot in roster_positions:
+        if slot == "BN":
+            bench += 1
+            continue
+        if slot in ("IR", "TAXI"):
+            continue
+        if "FLEX" in slot:
+            flex_slots += 1
+            if "SUPER" in slot:
+                superflex = True
+        else:
+            starters[slot] += 1
+
+    total_roster = sum(starters.values()) + flex_slots + bench
+
+    targets = {
+        "QB": max(starters.get("QB", 0), 2 if superflex else 1),
+        "TE": max(starters.get("TE", 0), 1),
+        "K": starters.get("K", 0),
+        "DEF": starters.get("DEF", 0),
+    }
+    remaining = max(total_roster - sum(targets.values()), 0)
+    rb_share = (remaining + 1) // 2          # RB takes the odd slot
+    targets["RB"] = max(starters.get("RB", 0), rb_share)
+    targets["WR"] = max(starters.get("WR", 0), remaining - rb_share)
+
+    if override:
+        for part in override.split(","):
+            if "=" not in part:
+                continue
+            pos, _, val = part.partition("=")
+            pos = pos.strip().upper()
+            try:
+                targets[pos] = int(val)
+            except ValueError:
+                continue
+
+    return targets
+
+
 def positional_run(picks: list, players: dict, window: int = 10) -> Counter:
     counts = Counter()
     for pick in picks[-window:]:
@@ -739,74 +790,138 @@ def build_board(players: dict, drafted_ids: set, sheet_index: dict, limit: int =
     return board[:limit]
 
 
-def recommend(board: list, needs: dict, my_picks: list, next_pick_no: int,
-              runs: Counter, top_n: int = 6) -> dict:
-    """Pure local scoring: value, need, scarcity, and survival to the wrap."""
+def recommend(board: list, starter_needs: dict, targets: dict, have: Counter,
+              my_picks: list, next_pick_no: int, runs: Counter,
+              picks_left: int, top_n: int = 6) -> dict:
+    """Local scoring: board value, starter needs, bench depth targets, scarcity,
+    and survival to the wrap. Every adjustment records a reason so the
+    recommendation can explain itself."""
     if not board:
-        return {"picks": [], "wait": [], "gone": []}
+        return {"picks": [], "wait": [], "risky": [], "survival_cutoff": next_pick_no}
 
     wrap_pick = my_picks[1] if len(my_picks) > 1 else None
-    # Players whose rank sits before our next-next pick are unlikely to survive it.
     survival_cutoff = wrap_pick if wrap_pick else next_pick_no + 12
+    # Ranks within a few of the cutoff are coin flips, not safe holds.
+    risky_band = max(int(survival_cutoff * 0.15), 4)
 
-    needed_positions = {p for p in needs if p != "FLEX"}
-    if needs.get("FLEX"):
-        needed_positions |= FLEX_ELIGIBLE
+    starter_positions = {p for p in starter_needs if p != "FLEX"}
+    if starter_needs.get("FLEX"):
+        starter_positions |= FLEX_ELIGIBLE
 
     scored = []
     for p in board:
-        score = 1000.0 - p["rank"]           # base: board value
-        if p["pos"] in needed_positions:
-            score += 40                       # fills a hole in the starting lineup
-        if runs.get(p["pos"], 0) >= 3:
-            score += 15                       # position is running; supply draining
+        pos = p["pos"]
+        score = 1000.0 - p["rank"]
+        reasons = []
+
+        short_of_target = targets.get(pos, 0) - have.get(pos, 0)
+
+        if pos in starter_positions:
+            # More unfilled starting slots at a position means more urgency.
+            missing = starter_needs.get(pos, 1)
+            score += 50 + min(missing - 1, 2) * 10
+            reasons.append(f"fills starting {pos}")
+        elif short_of_target > 0:
+            # Scale with the gap: five bodies short at RB is not the same as one
+            # short at WR, and a flat bonus lets board rank override real need.
+            score += min(short_of_target * 12, 60)
+            reasons.append(f"depth: {have.get(pos,0)}/{targets.get(pos,0)} {pos}")
+
+        if short_of_target <= 0:
+            # Already at target. A second K or DEF is never worth a roster spot.
+            if pos in ("K", "DEF"):
+                score -= 500
+                reasons.append(f"already have a {pos}")
+            else:
+                score -= 60
+                reasons.append(f"{pos} at target ({have.get(pos,0)})")
+
+        # Kickers and defenses belong in the last two rounds, never before.
+        if pos in ("K", "DEF") and picks_left > 2:
+            score -= 400
+            reasons.append(f"too early for {pos} ({picks_left} picks left)")
+
+        if runs.get(pos, 0) >= 3:
+            score += 15
+            reasons.append(f"{pos} run ({runs[pos]} of last 10)")
+
         gone_by_wrap = p["rank"] <= survival_cutoff
+        borderline = survival_cutoff < p["rank"] <= survival_cutoff + risky_band
         if gone_by_wrap:
-            score += 25                       # will not be there on the wrap
+            score += 25
+            reasons.append("gone by your wrap")
+
         if p["injury"]:
             score -= 10
+            reasons.append(str(p["injury"]))
         if not p["ranked"]:
-            score -= 200                      # not on the cheat sheet; low confidence
-        scored.append((score, gone_by_wrap, p))
+            score -= 200
+            reasons.append("not on your board")
 
-    scored.sort(key=lambda t: -t[0])
-    picks = [(s, g, p) for s, g, p in scored[:top_n]]
-    wait = [p for s, g, p in scored[:25] if not g and p["ranked"]][:4]
-    return {"picks": picks, "wait": wait, "survival_cutoff": survival_cutoff}
+        scored.append({"score": score, "gone": gone_by_wrap, "borderline": borderline,
+                       "player": p, "reasons": reasons})
+
+    scored.sort(key=lambda s: -s["score"])
+    top = scored[:top_n]
+    pool = scored[:30]
+    wait = [s for s in pool if not s["gone"] and not s["borderline"] and s["player"]["ranked"]][:4]
+    risky = [s for s in pool if s["borderline"] and s["player"]["ranked"]][:3]
+    return {"picks": top, "wait": wait, "risky": risky,
+            "survival_cutoff": survival_cutoff, "risky_band": risky_band}
 
 
-def render_recommendation(reco: dict, needs: dict, my_picks: list, draft: dict) -> None:
-    print("=" * 64)
+def render_recommendation(reco: dict, my_picks: list, draft: dict,
+                          targets: dict, have: Counter) -> None:
+    print("=" * 66)
     print("RECOMMENDATION")
-    print("=" * 64)
+    print("=" * 66)
     if not reco["picks"]:
         print("No available players found.")
         return
 
-    best_score, best_gone, best = reco["picks"][0]
-    flag = "WILL NOT LAST" if best_gone else "safe-ish"
-    note = f" — {best['note']}" if best["note"] else ""
-    tier = f" T{best['tier']}" if best["tier"] else ""
-    print(f"\n  PICK: {best['name']} ({best['pos']}, {best['team']}){tier}  [{flag}]{note}")
+    best = reco["picks"][0]
+    p = best["player"]
+    tier = f" T{p['tier']}" if p["tier"] else ""
+    print(f"\n  TAKE: {p['name']} ({p['pos']}, {p['team']}){tier}")
+    if p["note"]:
+        print(f"        {p['note']}")
+    if best["reasons"]:
+        print(f"        why: {' · '.join(best['reasons'])}")
 
-    print("\n  NEXT BEST:")
-    for score, gone, p in reco["picks"][1:5]:
-        tier = f" T{p['tier']}" if p["tier"] else ""
-        mark = "gone by wrap" if gone else "may last"
-        extra = f" — {p['note']}" if p["note"] else ""
-        inj = f" [{p['injury']}]" if p["injury"] else ""
-        print(f"    {p['name']} ({p['pos']}, {p['team']}){tier}{inj}  ({mark}){extra}")
+    print("\n  IF HE'S GONE:")
+    for s in reco["picks"][1:5]:
+        q = s["player"]
+        tier = f" T{q['tier']}" if q["tier"] else ""
+        inj = f" [{q['injury']}]" if q["injury"] else ""
+        why = f"  ({' · '.join(s['reasons'][:2])})" if s["reasons"] else ""
+        print(f"    {q['name']} ({q['pos']}, {q['team']}){tier}{inj}{why}")
+
+    if reco["risky"]:
+        print("\n  COIN FLIP (right at the edge of surviving your wrap):")
+        for s in reco["risky"]:
+            q = s["player"]
+            print(f"    {q['name']} ({q['pos']}) — ranked {q['rank']}, "
+                  f"cutoff is {reco['survival_cutoff']}")
 
     if reco["wait"]:
-        print("\n  CAN WAIT (likely still there at your next pick):")
-        for p in reco["wait"]:
-            print(f"    {p['name']} ({p['pos']})")
+        print("\n  SAFE TO WAIT ON:")
+        for s in reco["wait"]:
+            q = s["player"]
+            print(f"    {q['name']} ({q['pos']})")
+
+    # Roster progress against the full-draft plan, not just starters.
+    shape = "  ".join(
+        f"{pos} {have.get(pos, 0)}/{targets.get(pos, 0)}"
+        for pos in ("QB", "RB", "WR", "TE", "K", "DEF")
+        if targets.get(pos, 0)
+    )
+    print(f"\n  ROSTER PLAN: {shape}")
 
     if len(my_picks) > 1:
         gap = my_picks[1] - my_picks[0] - 1
-        print(f"\n  WRAP: after this you pick {describe_pick(draft, my_picks[1])} "
-              f"— {gap} picks away. Anything ranked inside the top "
-              f"{reco['survival_cutoff']} is unlikely to survive.")
+        print(f"  WRAP: next pick after this is {describe_pick(draft, my_picks[1])}, "
+              f"{gap} picks away — assume anyone inside the top "
+              f"{reco['survival_cutoff']} is gone.")
     print()
 
 
@@ -893,8 +1008,14 @@ def run_live(args) -> int:
             ((players.get(p.get("player_id")) or {}).get("position") for p in my_own)
             if pos
         ]
-        needs = compute_needs(roster_positions_for(draft, league), my_positions)
+        roster_positions = roster_positions_for(draft, league)
+        needs = compute_needs(roster_positions, my_positions)
+        targets = compute_depth_targets(roster_positions, args.targets)
+        have = Counter(my_positions)
         runs = positional_run(picks, players)
+
+        rounds = (draft.get("settings") or {}).get("rounds") or 16
+        picks_left = len(my_upcoming_picks(draft, next_pick_no, my_slot, rounds)) if my_slot else 0
 
         os.system(clear_cmd)
         print(f"=== {str(draft.get('status','?')).upper()} | {len(picks)} picks in | "
@@ -919,8 +1040,8 @@ def run_live(args) -> int:
         print()
 
         board = build_board(players, drafted_ids, sheet_index)
-        reco = recommend(board, needs, my_picks, next_pick_no, runs)
-        render_recommendation(reco, needs, my_picks, draft)
+        reco = recommend(board, needs, targets, have, my_picks, next_pick_no, runs, picks_left)
+        render_recommendation(reco, my_picks, draft, targets, have)
 
         if args.once:
             return 0
@@ -952,6 +1073,8 @@ def main() -> int:
     parser.add_argument("--league-id", help="Sleeper league ID")
     parser.add_argument("--draft-id", help="Sleeper draft ID directly (mock drafts)")
     parser.add_argument("--my-username", help="Your Sleeper username (required for live mode)")
+    parser.add_argument("--targets",
+                        help="Override depth targets, e.g. 'RB=7,WR=5'")
     parser.add_argument("--slot", type=int,
                         help="Your draft position (1 = first pick). Use when Sleeper "
                              "has not published the draft order yet.")

@@ -655,6 +655,15 @@ def my_slot_from_draft(draft: dict, my_user_id: str, my_roster_id=None):
     return None
 
 
+def roster_id_for_slot(draft: dict, slot):
+    """The draft's own slot->roster_id map, authoritative for this draft
+    regardless of whether the league-side owner/co-owner lookup succeeded."""
+    if slot is None:
+        return None
+    slot_map = draft.get("slot_to_roster_id") or {}
+    return slot_map.get(str(slot), slot_map.get(slot))
+
+
 # --- Roster analysis --------------------------------------------------------
 
 def roster_positions_for(draft: dict, league: dict) -> list:
@@ -823,6 +832,15 @@ def recommend(board: list, starter_needs: dict, targets: dict, have: Counter,
     if starter_needs.get("FLEX"):
         starter_positions |= FLEX_ELIGIBLE
 
+    # K/DEF should wait for skill positions — but only while there's still a
+    # real skill-position need. Gating purely on "picks left in the whole
+    # draft" ignores whether those targets were already met, which forces
+    # drafting redundant RB/WR depth past target instead of taking the kicker
+    # once there's genuinely nothing better on the board.
+    skill_positions_done = all(
+        targets.get(pos, 0) - have.get(pos, 0) <= 0 for pos in ("QB", "RB", "WR", "TE")
+    ) and not starter_positions
+
     scored = []
     for p in board:
         pos = p["pos"]
@@ -851,8 +869,9 @@ def recommend(board: list, starter_needs: dict, targets: dict, have: Counter,
                 score -= 60
                 reasons.append(f"{pos} at target ({have.get(pos,0)})")
 
-        # Kickers and defenses belong in the last two rounds, never before.
-        if pos in ("K", "DEF") and picks_left > 2:
+        # Kickers and defenses belong late — either your last two picks, or
+        # any time sooner if there's genuinely no skill-position need left.
+        if pos in ("K", "DEF") and picks_left > 2 and not skill_positions_done:
             score -= 400
             reasons.append(f"too early for {pos} ({picks_left} picks left)")
 
@@ -1000,6 +1019,16 @@ def run_live(args) -> int:
             print("Draft order not published by Sleeper yet — it often stays hidden until "
                   "the draft starts.")
             print("If you already know your pick position, pass it: --slot N")
+
+    # The draft's own slot->roster_id map is authoritative for this draft.
+    # The league-side owner/co-owner lookup above has more ways to go wrong
+    # (co-owned rosters, field-shape mismatches) — once the slot is known,
+    # trust the draft's mapping over it.
+    slot_roster_id = roster_id_for_slot(draft, my_slot)
+    if slot_roster_id is not None and slot_roster_id != my_roster_id:
+        print(f"Roster id corrected via draft slot mapping: {my_roster_id} -> {slot_roster_id}")
+        my_roster_id = slot_roster_id
+
     time.sleep(1.5)
 
     clear_cmd = "cls" if os.name == "nt" else "clear"
@@ -1010,6 +1039,12 @@ def run_live(args) -> int:
         next_pick_no = len(picks) + 1
         if my_slot is None and not args.slot:
             my_slot = my_slot_from_draft(draft, my_user["user_id"], my_roster_id)
+
+        # Re-check every loop: slot_to_roster_id may only populate once the
+        # draft actually starts, so the correction can only land after that.
+        slot_roster_id = roster_id_for_slot(draft, my_slot)
+        if slot_roster_id is not None and slot_roster_id != my_roster_id:
+            my_roster_id = slot_roster_id
 
         my_picks = my_upcoming_picks(draft, next_pick_no, my_slot) if my_slot else []
         drafted_ids = {p.get("player_id") for p in picks}
